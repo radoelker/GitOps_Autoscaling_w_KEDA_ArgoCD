@@ -95,10 +95,118 @@ HPA sees 3% CPU and thinks: "all good, no scaling needed." The queue has 50,000 
 
 **CPU is the wrong signal.** Queue depth is the right signal.
 
+
+
 ### Why KEDA?
 
 **KEDA** (Kubernetes Event Driven Autoscaling) lets you scale on the thing that actually matters: the queue depth itself. KEDA actually creates and manages an HPA under the hood — it just feeds it a custom metric (queue depth) instead of CPU. While HPA has a hard minimum of 1 pod,  KEDA can scale down to 0.
 
+##### Install KEDA
+
+```bash
+helm repo add kedacore <https://kedacore.github.io/charts>
+helm repo update
+
+helm install keda kedacore/keda \\
+  --namespace keda \\
+  --create-namespace \\
+  --wait
+```
+
+Verify it's running:
+
+```bash
+kubectl get pods -n keda
+```
+
+You should see two pods: `keda-operator-*` and `keda-operator-metrics-apiserver-*`, both running.
+
+
+
 ### Why GitOps (ArgoCD)?
 
 GitOps means one thing: Git is the single source of truth for what should be running in the cluster. **ArgoCD** enforces this. If your YAML is in Git, it's deployed. If it's not in Git, it doesn't exist in the cluster.
+
+##### Install ArgoCD in the cluster
+
+```bash
+kubectl create namespace argocd
+
+kubectl apply -n argocd \\
+  -f <https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml>
+
+kubectl rollout status deployment/argocd-server -n argocd
+```
+
+Get the initial admin password:
+
+```bash
+kubectl get secret argocd-initial-admin-secret -n argocd \\
+  -o jsonpath="{.data.password}" | base64 -d
+```
+
+Expose the ArgoCD UI:
+
+```bash
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+```
+
+Open `https://localhost:8080`. Username: `admin`. Password: what you just copied.
+
+##### Install the ArgoCD CLI locally
+
+```bash
+# macOS
+brew install argocd
+
+# Linux
+sudo curl -sSL -o /usr/local/bin/argocd \\
+  <https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64>
+sudo chmod +x /usr/local/bin/argocd
+```
+
+Log in:
+
+```bash
+argocd login localhost:8080 --username admin --insecure
+```
+
+
+
+## The Setup
+
+
+
+keda-scaledobject.yaml
+
+```
+  ...
+  scaleTargetRef:
+    name: worker        <== who is scaled
+  minReplicaCount: 0    <== what is the minimum number of pods (unlike HPA it can be 0)
+  maxReplicaCount: 10   <== maximum number of pods
+  cooldownPeriod: 300   <== waiting 300s before scaling down, avoid flipping
+  pollingInterval: 15   <== check (poll) every 15s
+  triggers:
+    - ...
+      metadata:
+        queueLength: "10" <= monitored value and threshold for scaling up
+```
+
+infra/alerting/event-exporter.yaml (ConfigMap)
+
+```
+    logLevel: info
+    logFormat: json
+    route:
+      routes:
+        - match:
+            - receiver: "sns-alerts"
+              reason: "SuccessfulRescale|FailedScale|ScalingReplicaSet"  <== events that fire an alarm
+              namespace: "logiflow"
+    receivers:
+      - name: "sns-alerts"
+        webhook:
+          endpoint: "http://sns-notifier.logiflow.svc.cluster.local:8080/notify" <= sent to webhook
+```
+
